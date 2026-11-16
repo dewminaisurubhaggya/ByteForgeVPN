@@ -1,0 +1,192 @@
+name: Build Byte Forge VPN Windows Installer
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows-installer:
+    name: Build & Package Windows x64 Installer
+    runs-on: windows-2022
+
+    env:
+      BUILD_DIR: ${{ github.workspace }}\build
+      DIST_DIR: ${{ github.workspace }}\dist\ByteForgeVPN
+      INSTALLER_DIR: ${{ github.workspace }}\dist\installer
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6.8.3 (MSVC 2022 64-bit)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2022_64'
+          cache: 'true'
+
+      - name: Setup MSVC 2022 x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake project
+        shell: pwsh
+        run: |
+          cmake -S . -B "$env:BUILD_DIR" `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build ByteForgeVPN (Release)
+        shell: pwsh
+        run: |
+          cmake --build "$env:BUILD_DIR" --config Release --parallel
+
+      - name: Verify compiled executable exists
+        shell: pwsh
+        run: |
+          $exePath = Join-Path $env:BUILD_DIR "ByteForgeVPN.exe"
+          if (-not (Test-Path $exePath)) {
+            Write-Error "Build failed: ByteForgeVPN.exe was not found at $exePath"
+            exit 1
+          }
+          Write-Host "Verified compiled executable: $exePath"
+
+      - name: Bundle Qt runtime DLLs and plugins with windeployqt
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:DIST_DIR" | Out-Null
+          Copy-Item -Path (Join-Path $env:BUILD_DIR "ByteForgeVPN.exe") -Destination "$env:DIST_DIR\" -Force
+
+          $windeployqt = Join-Path $env:QT_ROOT_DIR "bin\windeployqt.exe"
+          if (-not (Test-Path $windeployqt)) {
+            Write-Error "windeployqt.exe not found at $windeployqt"
+            exit 1
+          }
+
+          & $windeployqt `
+            --release `
+            --no-translations `
+            --no-system-d3d-compiler `
+            --no-opengl-sw `
+            --dir "$env:DIST_DIR" `
+            (Join-Path $env:DIST_DIR "ByteForgeVPN.exe")
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "windeployqt failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Copy MSVC C++ Runtime DLLs for standalone Windows 10 compatibility
+        shell: pwsh
+        run: |
+          $vcRedistDir = $env:VCToolsRedistDir
+          if ($vcRedistDir) {
+            $crtDirs = Get-ChildItem -Path (Join-Path $vcRedistDir "x64") -Filter "Microsoft.VC*.CRT" -Directory -ErrorAction SilentlyContinue
+            foreach ($dir in $crtDirs) {
+              Copy-Item -Path (Join-Path $dir.FullName "*.dll") -Destination "$env:DIST_DIR\" -Force
+              Write-Host "Bundled MSVC runtime DLLs from $($dir.FullName)"
+            }
+          }
+
+      - name: Quality Control — Verify bundled DLLs and plugins
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "ByteForgeVPN.exe",
+            "Qt6Core.dll",
+            "Qt6Gui.dll",
+            "Qt6Widgets.dll",
+            "Qt6Sql.dll",
+            "platforms\qwindows.dll",
+            "sqldrivers\qsqlite.dll"
+          )
+          $missing = @()
+          foreach ($relPath in $requiredFiles) {
+            $fullPath = Join-Path $env:DIST_DIR $relPath
+            if (-not (Test-Path $fullPath)) {
+              $missing += $relPath
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error "Deployment verification failed. Missing required runtime files: $($missing -join ', ')"
+            exit 1
+          }
+          Write-Host "All required Qt DLLs, platform plugins, and SQLite drivers verified in $env:DIST_DIR"
+
+      - name: Locate or install Inno Setup 6 and build ByteForgeVPN_Setup.exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:INSTALLER_DIR" | Out-Null
+
+          $isccCandidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "C:\ProgramData\chocolatey\bin\ISCC.exe"
+          )
+          $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $iscc) {
+            Write-Host "Inno Setup 6 not found in default paths; installing via Chocolatey..."
+            choco install innosetup -y --no-progress
+            $iscc = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+
+          if (-not $iscc) {
+            Write-Error "Unable to locate ISCC.exe after installation attempt."
+            exit 1
+          }
+
+          Write-Host "Using Inno Setup compiler: $iscc"
+          & $iscc `
+            "/DDistDir=$env:DIST_DIR" `
+            "/DOutputDir=$env:INSTALLER_DIR" `
+            "installer\ByteForgeVPN.iss"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Inno Setup compilation failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+      - name: Quality Control — Verify installer output and test silent install/uninstall
+        shell: pwsh
+        run: |
+          $setupExe = Join-Path $env:INSTALLER_DIR "ByteForgeVPN_Setup.exe"
+          if (-not (Test-Path $setupExe)) {
+            Write-Error "Installer verification failed: ByteForgeVPN_Setup.exe not found at $setupExe"
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $setupExe).Length / 1MB, 2)
+          Write-Host "Verified ByteForgeVPN_Setup.exe ($sizeMB MB)"
+
+          # Test silent installation into a temporary test directory
+          $testInstallDir = Join-Path $env:RUNNER_TEMP "ByteForgeVPN_InstallTest"
+          Start-Process -FilePath $setupExe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$testInstallDir`"" -Wait -NoNewWindow
+
+          $installedExe = Join-Path $testInstallDir "ByteForgeVPN.exe"
+          if (-not (Test-Path $installedExe)) {
+            Write-Error "Silent install smoke test failed: ByteForgeVPN.exe was not installed to $testInstallDir"
+            exit 1
+          }
+          Write-Host "Silent install smoke test passed: $installedExe exists."
+
+          # Test silent uninstallation
+          $uninstaller = Join-Path $testInstallDir "unins000.exe"
+          if (Test-Path $uninstaller) {
+            Start-Process -FilePath $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -NoNewWindow
+            Write-Host "Silent uninstall smoke test completed."
+          }
+
+      - name: Upload ByteForgeVPN_Setup.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ByteForgeVPN_Setup-Windows-x64
+          path: ${{ env.INSTALLER_DIR }}\ByteForgeVPN_Setup.exe
+          if-no-files-found: error
+          retention-days: 30
